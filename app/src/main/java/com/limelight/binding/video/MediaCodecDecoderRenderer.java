@@ -64,15 +64,122 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     public void setPreferLowerDelaysTimeoutUs(int us) { this.preferLowerDelaysTimeoutUs = Math.max(0, us); }
 
 
+    // ---- Tuned build: per-frame trace so the time from decode to the display can be measured over adb ----
+    // Every frame handed to the display is logged with its target time, when it was decoded, when the decode
+    // unit entered the decoder and when it was released. The PC joins this with SurfaceFlinger's present times.
+    public static volatile MediaCodecDecoderRenderer active;
+    private static final int OUT_SLOTS = 64;
+    private static final int FRAME_LOG_SIZE = 512;
+    private final long[] slotDequeueNs = new long[OUT_SLOTS];
+    private final long[] slotEnqueueNs = new long[OUT_SLOTS];
+    private final long[] logTargetNs = new long[FRAME_LOG_SIZE];
+    private final long[] logCallNs = new long[FRAME_LOG_SIZE];
+    private final long[] logDequeueNs = new long[FRAME_LOG_SIZE];
+    private final long[] logEnqueueNs = new long[FRAME_LOG_SIZE];
+    private int frameLogCount;
+    // Arrival of every decode unit and output of every decoded frame, shown or not, to see how frames come in
+    private static final int CADENCE_LOG_SIZE = 512;
+    private final long[] inputLogNs = new long[CADENCE_LOG_SIZE];
+    private final long[] outputLogNs = new long[CADENCE_LOG_SIZE];
+    private int inputLogCount;
+    private int outputLogCount;
+
+    // The per-frame trace costs a little on every frame, so it only runs when the tuned_trace preference is on
+    private int traceState = -1;
+    private boolean tracing() {
+        if (!TUNED_BUILD) {
+            return false;
+        }
+        if (traceState < 0) {
+            traceState = androidx.preference.PreferenceManager.getDefaultSharedPreferences(context).getBoolean("tuned_trace", false) ? 1 : 0;
+        }
+        return traceState == 1;
+    }
+
+    private void noteInput(long nowNs) {
+        if (tracing()) {
+            inputLogNs[inputLogCount++ % CADENCE_LOG_SIZE] = nowNs;
+        }
+    }
+
+    private void noteDequeued(int index, long presentationTimeUs) {
+        if (!tracing() || index < 0) {
+            return;
+        }
+        int slot = index & (OUT_SLOTS - 1);
+        long nowNs = System.nanoTime();
+        slotDequeueNs[slot] = nowNs;
+        outputLogNs[outputLogCount++ % CADENCE_LOG_SIZE] = nowNs;
+        Long enqueueNs = enqueueNsByPtsUs.get(presentationTimeUs);
+        slotEnqueueNs[slot] = enqueueNs != null ? enqueueNs : 0L;
+    }
+
+    // Release a frame to the display at the given target time and, in the tuned build, trace it
+    private void renderAt(int index, long targetNs) {
+        long callNs = System.nanoTime();
+        videoDecoder.releaseOutputBuffer(index, targetNs);
+        if (tracing()) {
+            int slot = index & (OUT_SLOTS - 1);
+            synchronized (logTargetNs) {
+                int at = frameLogCount % FRAME_LOG_SIZE;
+                logTargetNs[at] = targetNs;
+                logCallNs[at] = callNs;
+                logDequeueNs[at] = slotDequeueNs[slot];
+                logEnqueueNs[at] = slotEnqueueNs[slot];
+                frameLogCount++;
+            }
+        }
+    }
+
+    private static void appendCadence(java.util.List<String> lines, String tag, long[] ring, int count, int maxFrames) {
+        StringBuilder line = new StringBuilder(tag);
+        int available = Math.min(Math.min(count, CADENCE_LOG_SIZE), maxFrames);
+        for (int i = available; i > 0; i--) {
+            line.append(ring[(count - i) % CADENCE_LOG_SIZE]).append(',');
+            if (line.length() > 3000) {
+                lines.add(line.toString());
+                line.setLength(0);
+                line.append(tag);
+            }
+        }
+        if (line.length() > tag.length()) {
+            lines.add(line.toString());
+        }
+    }
+
+    /** The most recent traced frames as lines of "target,call,dequeue,enqueue;" in nanoTime units. */
+    public java.util.List<String> frameLogLines(int maxFrames) {
+        java.util.ArrayList<String> lines = new java.util.ArrayList<>();
+        StringBuilder line = new StringBuilder();
+        synchronized (logTargetNs) {
+            int available = Math.min(Math.min(frameLogCount, FRAME_LOG_SIZE), maxFrames);
+            for (int i = available; i > 0; i--) {
+                int at = (frameLogCount - i) % FRAME_LOG_SIZE;
+                line.append(logTargetNs[at]).append(',').append(logCallNs[at]).append(',')
+                        .append(logDequeueNs[at]).append(',').append(logEnqueueNs[at]).append(';');
+                if (line.length() > 3000) {
+                    lines.add(line.toString());
+                    line.setLength(0);
+                }
+            }
+        }
+        if (line.length() > 0) {
+            lines.add(line.toString());
+        }
+        appendCadence(lines, "I;", inputLogNs, inputLogCount, maxFrames);
+        appendCadence(lines, "O;", outputLogNs, outputLogCount, maxFrames);
+        return lines;
+    }
+
     // Helper: release with low-latency policy (immediate only when very near to now)
     private void releaseWithPolicy(int bufferIndex, long frameTimeNanos) {
         try {
             long now = System.nanoTime();
             boolean immediate = preferLowerDelays && (frameTimeNanos <= now + 300_000L);
-            if (immediate) {
+            if (immediate && !TUNED_BUILD) {
                 videoDecoder.releaseOutputBuffer(bufferIndex, true);
             } else {
-                videoDecoder.releaseOutputBuffer(bufferIndex, frameTimeNanos);
+                renderAt(bufferIndex, immediate ? now : frameTimeNanos);
             }
         } catch (Throwable t) {
             try {
@@ -81,6 +188,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             } catch (Throwable ignored) {}
         }
     }
+    // Tuned build: how long the "keep only the newest frame" drain waits for a newer frame, in microseconds.
+    // Preference tuned_drain_us (default 0: never wait); below zero keeps the stock wait.
+    private int tunedDrainUs = Integer.MIN_VALUE;
+    private int drainTimeoutUs() {
+        if (!TUNED_BUILD) {
+            return getOutputDequeueTimeoutUs();
+        }
+        if (tunedDrainUs == Integer.MIN_VALUE) {
+            tunedDrainUs = androidx.preference.PreferenceManager.getDefaultSharedPreferences(context).getInt("tuned_drain_us", 0);
+        }
+        return tunedDrainUs >= 0 ? tunedDrainUs : getOutputDequeueTimeoutUs();
+    }
+
     private int getOutputDequeueTimeoutUs(){ return preferLowerDelays ? Math.max(250, preferLowerDelaysTimeoutUs) : preferLowerDelaysTimeoutUs; }
 
     // Update stats using real decode time: enqueue->dequeue, instead of uptime - PTS
@@ -1095,7 +1215,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             // ULL: present at next VSYNC (no scheduling)
                             releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
                             // Smooth/Balanced: keep timestamp scheduling
-                            videoDecoder.releaseOutputBuffer(nextOutputBuffer, frameTimeNanos);
+                            renderAt(nextOutputBuffer, frameTimeNanos);
                         }
 
                     }
@@ -1221,6 +1341,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                             // Drain non-blocking; keep only the newest buffer
                             while (__idx >= 0) {
+                                noteDequeued(__idx, __tmpInfo.presentationTimeUs);
                                 if (__last >= 0) {
                                     try { videoDecoder.releaseOutputBuffer(__last, false); } catch (Throwable ignored) {}
                                 }
@@ -1263,6 +1384,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         }
 
                         if (outIndex >= 0) {
+                            noteDequeued(outIndex, info.presentationTimeUs);
                             // --- flags per gestire le statistiche in modo robusto ---
                             boolean statsUpdated = false;
                             boolean frameDropped = false;
@@ -1285,7 +1407,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             // Render the latest frame now if frame pacing isn't in balanced mode
                             if (prefs.framePacing != PreferenceConfiguration.FRAME_PACING_BALANCED) {
                                 // Get the last output buffer in the queue
-                                while ((outIndex = videoDecoder.dequeueOutputBuffer(info, getOutputDequeueTimeoutUs())) >= 0) {
+                                while ((outIndex = videoDecoder.dequeueOutputBuffer(info, drainTimeoutUs())) >= 0) {
+                                    noteDequeued(outIndex, info.presentationTimeUs);
                                     videoDecoder.releaseOutputBuffer(lastIndex, false);
                                     frameDropped = true; // we're discarding the oldest one
 
@@ -1326,7 +1449,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             // ULL: present at next VSYNC (no scheduling)
                                             releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                             // Smooth/Balanced: keep timestamp scheduling
-                                            videoDecoder.releaseOutputBuffer(lastIndex, nowNs);
+                                            renderAt(lastIndex, nowNs);
                                         }
 
                                         lastPresentNs = nowNs;
@@ -1399,7 +1522,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             // ULL: present at next VSYNC (no scheduling)
                                             releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                             // Smooth/Balanced: keep timestamp scheduling
-                                            videoDecoder.releaseOutputBuffer(lastIndex, nowNs);
+                                            renderAt(lastIndex, nowNs);
                                         }
 
                                         lastPresentNs = nowNs;
@@ -1576,6 +1699,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void start() {
+        active = this;
         startRendererThread();
         startChoreographerThread();
     }
@@ -1687,7 +1811,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     timestampUs, codecFlags);
 
             // Track enqueue time for this PTS
-            try { enqueueNsByPtsUs.put(timestampUs, System.nanoTime()); } catch (Throwable ignored) {}
+            try { long nowNs = System.nanoTime(); enqueueNsByPtsUs.put(timestampUs, nowNs); noteInput(nowNs); } catch (Throwable ignored) {}
 
             // We need a new buffer now
             nextInputBufferIndex = -1;

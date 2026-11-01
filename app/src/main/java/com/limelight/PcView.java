@@ -208,7 +208,7 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
     }
 
     // Bumped whenever the tuned defaults change, so they are written again once
-    private static final int TUNED_DEFAULTS_VERSION = 1;
+    private static final int TUNED_DEFAULTS_VERSION = 2;
 
     // Settings matching the Fire TV Stick 4K Max and a 1080p120 virtual display on the host.
     // Written once per version so the user's later changes stick.
@@ -227,7 +227,14 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
                 .putBoolean("checkbox_unlock_fps", true)
                 .putString("video_format", "forceh265")
                 .putString("frame_pacing", "latency")
-                .putBoolean("checkbox_enable_perf_overlay", true)
+                .putBoolean("checkbox_enable_perf_overlay", false)
+                // Settings that won the latency measurements (see the bench experiments): release every decoded frame
+                // at once, 40 Mbps costs no latency over the default and the 60+ Mbps range starts to
+                .putBoolean("tuned_honor_pacing", true)
+                .putBoolean("pref_low_latency_frame_balance", true)
+                .putInt("tuned_drain_us", 0)
+                .putInt("seekbar_bitrate_kbps", 40000)
+                .putBoolean("checkbox_ultra_low_latency", false)
                 .putInt("tuned_defaults_version", TUNED_DEFAULTS_VERSION)
                 .apply();
     }

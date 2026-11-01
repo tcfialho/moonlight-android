@@ -688,18 +688,25 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         } catch (Throwable ignored) {}
 
 // --- latency profile selection ---
+        // Tuned build: keeps the configured frame pacing mode (Min latency) instead of forcing Balanced, unless tuned_honor_pacing is off
+        final boolean honorPacing = "tuned".equals(BuildConfig.BUILD_TYPE) &&
+                PreferenceManager.getDefaultSharedPreferences(this).getBoolean("tuned_honor_pacing", true);
         try {
             if (prefConfig != null && prefConfig.preferLowerDelays) {
                 // Intermediate: more responsive than Balanced but not 0 µs
                 decoderRenderer.setPreferLowerDelays(true);
                 decoderRenderer.setPreferLowerDelaysTimeoutUs(500);  // 0.5 ms
-                prefConfig.framePacing = PreferenceConfiguration.FRAME_PACING_BALANCED;
+                if (!honorPacing) {
+                    prefConfig.framePacing = PreferenceConfiguration.FRAME_PACING_BALANCED;
+                }
                 LimeLog.info("PreferLowerDelays: preferLowerDelays=true, timeout=500us, pacing=BALANCED");
             } else {
                 // Balanced default
                 decoderRenderer.setPreferLowerDelays(false);
                 decoderRenderer.setPreferLowerDelaysTimeoutUs(2000); // 2 ms
-                prefConfig.framePacing = PreferenceConfiguration.FRAME_PACING_BALANCED;
+                if (!honorPacing) {
+                    prefConfig.framePacing = PreferenceConfiguration.FRAME_PACING_BALANCED;
+                }
                 LimeLog.info("Balanced: preferLowerDelays=false, timeout=2000us, pacing=BALANCED");
             }
         } catch (Throwable ignored) {}
