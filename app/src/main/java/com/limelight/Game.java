@@ -1550,6 +1550,23 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 refreshRateIsEqual = isRefreshRateEqualMatch(candidate.getRefreshRate());
             }
 
+            // Tuned build: tuned_output_height picks the output resolution (for example 1080 to skip the 4K upscale)
+            if ("tuned".equals(BuildConfig.BUILD_TYPE)) {
+                int wantedHeight = PreferenceManager.getDefaultSharedPreferences(this).getInt("tuned_output_height", 0);
+                if (wantedHeight > 0) {
+                    Display.Mode forced = null;
+                    for (Display.Mode candidate : currentDisplay.getSupportedModes()) {
+                        if (candidate.getPhysicalHeight() == wantedHeight &&
+                                (forced == null || candidate.getRefreshRate() > forced.getRefreshRate())) {
+                            forced = candidate;
+                        }
+                    }
+                    if (forced != null) {
+                        bestMode = forced;
+                    }
+                }
+            }
+
             LimeLog.info("Best display mode: "+bestMode.getPhysicalWidth()+"x"+
                     bestMode.getPhysicalHeight()+"x"+bestMode.getRefreshRate());
 
