@@ -149,6 +149,7 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
 
         // Set default preferences if we've never been run
         PreferenceManager.setDefaultValues(this, R.xml.preferences, false);
+        applyTunedDefaultsOnce();
 
         // Set the correct layout for the PC grid
         pcGridAdapter.updateLayoutWithPreferences(this, PreferenceConfiguration.readPreferences(this));
@@ -204,6 +205,31 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
             noPcFoundLayout.setVisibility(View.INVISIBLE);
         }
         pcGridAdapter.notifyDataSetChanged();
+    }
+
+    // Bumped whenever the tuned defaults change, so they are written again once
+    private static final int TUNED_DEFAULTS_VERSION = 1;
+
+    // Settings matching the Fire TV Stick 4K Max and a 1080p120 virtual display on the host.
+    // Written once per version so the user's later changes stick.
+    private void applyTunedDefaultsOnce() {
+        if (!"tuned".equals(BuildConfig.BUILD_TYPE)) {
+            return;
+        }
+        android.content.SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        if (prefs.getInt("tuned_defaults_version", 0) >= TUNED_DEFAULTS_VERSION) {
+            return;
+        }
+        prefs.edit()
+                .putString("list_resolution", "1920x1080")
+                .putString("list_fps", "120")
+                // Streaming faster than the 60 Hz output needs the FPS limit lifted
+                .putBoolean("checkbox_unlock_fps", true)
+                .putString("video_format", "forceh265")
+                .putString("frame_pacing", "latency")
+                .putBoolean("checkbox_enable_perf_overlay", true)
+                .putInt("tuned_defaults_version", TUNED_DEFAULTS_VERSION)
+                .apply();
     }
 
     @Override

@@ -53,6 +53,16 @@ ifeq ($(NDK_DEBUG),1)
 LOCAL_CFLAGS += -DLC_DEBUG
 endif
 
+# Aggressive optimization for the tuned build type
+ifeq ($(TUNED_BUILD),1)
+LOCAL_CFLAGS += -O3 -ffast-math -funroll-loops -fomit-frame-pointer -flto
+LOCAL_LDFLAGS += -O3 -flto
+# Fire TV Stick 4K Max runs a 32-bit userland on Cortex-A55 cores, which support ARMv8 AArch32 code
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+LOCAL_CFLAGS += -march=armv8-a+crc -mtune=cortex-a55 -mfpu=crypto-neon-fp-armv8
+endif
+endif
+
 LOCAL_LDLIBS := -llog
 
 LOCAL_STATIC_LIBRARIES := libopus libssl libcrypto cpufeatures

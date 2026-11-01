@@ -142,6 +142,23 @@ android {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+        // Local performance build: installs next to the official Artemis, with optimizing R8
+        // and native code tuned for the Fire TV Stick 4K Max (Cortex-A55, 32-bit userland)
+        tuned {
+            initWith release
+            applicationIdSuffix ".tuned"
+            resValue "string", "app_label", "Artemis Tuned"
+            resValue "string", "app_label_root", "Artemis Tuned (Root)"
+            resValue "string", "app_label_game", "Artemis Tuned (Game)"
+            signingConfig signingConfigs.debug
+            matchingFallbacks = ['release']
+            setProguardFiles([getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'])
+            externalNativeBuild {
+                ndkBuild {
+                    arguments "TUNED_BUILD=1"
+                }
+            }
+        }
     }
 
     externalNativeBuild {

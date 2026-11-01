@@ -1207,12 +1207,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 double ewmaJitterNs            = periodNs * 0.1;
 
                 BufferInfo info = new BufferInfo();
+                // Reused every iteration: this loop runs per frame, so a fresh object each time is pure GC churn
+                final BufferInfo __tmpInfo = new BufferInfo();
                 long lastOutputNs = System.nanoTime();
                 while (!stopping) {
                     /* LATEST_ONLY_LOW_LATENCY */
                     if (!preferLowerDelays) {
                         try {
-                            android.media.MediaCodec.BufferInfo __tmpInfo = new android.media.MediaCodec.BufferInfo();
                             int __idx = videoDecoder.dequeueOutputBuffer(__tmpInfo, 0);
                             int __last = -1;
                             long __lastPtsUs = -1L;
