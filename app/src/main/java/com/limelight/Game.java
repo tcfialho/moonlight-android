@@ -3944,6 +3944,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void onPerfUpdate(final String text) {
+        // Tuned build: mirror the overlay to logcat so the stats can be read remotely over adb
+        if ("tuned".equals(BuildConfig.BUILD_TYPE)) {
+            android.util.Log.i("TunedStats", text.replace('\n', '|'));
+        }
+        if (!prefConfig.enablePerfOverlay) {
+            return;
+        }
         runOnUiThread(new Runnable() {
             @Override
             public void run() {

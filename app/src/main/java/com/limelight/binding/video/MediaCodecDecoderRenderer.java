@@ -47,6 +47,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Latency profile: favor minimal end-to-end delay over absolute smoothness.
     // Set true to enable a 'latest-only' fast path in the render loop.
     private boolean preferLowerDelays = false;
+    private static final boolean TUNED_BUILD = "tuned".equals(com.limelight.BuildConfig.BUILD_TYPE);
 
 
     // Force tight thresholds regardless of device refresh (use vsyncPeriodNs always)
@@ -1772,7 +1773,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Flip stats windows roughly every second
         if (SystemClock.uptimeMillis() >= activeWindowVideoStats.measurementStartTimestamp + 1000) {
-            if (prefs.enablePerfOverlay || prefs.enablePerfLogging) {
+            // Tuned build always computes stats, so they reach logcat even with the overlay hidden
+            if (prefs.enablePerfOverlay || prefs.enablePerfLogging || TUNED_BUILD) {
                 VideoStats lastTwo = new VideoStats();
                 lastTwo.add(lastWindowVideoStats);
                 lastTwo.add(activeWindowVideoStats);
@@ -1877,7 +1879,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     sb.append(context.getString(R.string.perf_overlay_dectime, decodeTimeMs));
                 }
                 String fullLog = sb.toString();
-                if(prefs.enablePerfOverlay) {
+                if(prefs.enablePerfOverlay || TUNED_BUILD) {
                     perfListener.onPerfUpdate(fullLog);
                 }
                 // Best latency is only met at requested highest fps, rest can be ignored
