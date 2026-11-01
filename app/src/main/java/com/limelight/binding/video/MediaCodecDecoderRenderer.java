@@ -532,7 +532,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         int avcOptimalSlicesPerFrame = 0;
         int hevcOptimalSlicesPerFrame = 0;
         if (avcDecoder != null) {
-            directSubmit = MediaCodecHelper.decoderCanDirectSubmit(avcDecoder.getName());
+            // Tuned build: MediaTek decoders are fed straight from the receive thread too (measured on the
+            // Fire TV Stick 4K Max: no frame loss, one thread handoff and allocation less per frame)
+            directSubmit = MediaCodecHelper.decoderCanDirectSubmit(avcDecoder.getName()) ||
+                    (TUNED_BUILD && avcDecoder.getName().toLowerCase(java.util.Locale.US).startsWith("omx.mtk"));
             refFrameInvalidationAvc = MediaCodecHelper.decoderSupportsRefFrameInvalidationAvc(avcDecoder.getName(), initialHeight);
             avcOptimalSlicesPerFrame = MediaCodecHelper.getDecoderOptimalSlicesPerFrame(avcDecoder.getName());
 
@@ -1802,6 +1805,26 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
+    // Tuned build: time from frame reassembled (native, ms clock) to queued in the decoder, averaged per stats window.
+    // Both clocks are CLOCK_MONOTONIC; the ms truncation adds a constant ~0.5 ms, so compare it between runs only.
+    private static long handoffSumNs, handoffCount;
+
+    private static synchronized void noteHandoff(long nowNs, long timestampUs) {
+        long handoffNs = nowNs - timestampUs * 1000L;
+        if (handoffNs >= 0 && handoffNs < 1_000_000_000L) {
+            handoffSumNs += handoffNs;
+            handoffCount++;
+        }
+    }
+
+    // Mean handoff in ms since the last call, or -1 when no frame was queued
+    public static synchronized double takeTunedHandoffMs() {
+        double meanMs = handoffCount > 0 ? handoffSumNs / 1e6 / handoffCount : -1;
+        handoffSumNs = 0;
+        handoffCount = 0;
+        return meanMs;
+    }
+
     private boolean queueNextInputBuffer(long timestampUs, int codecFlags) {
         boolean codecRecovered;
 
@@ -1811,7 +1834,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     timestampUs, codecFlags);
 
             // Track enqueue time for this PTS
-            try { long nowNs = System.nanoTime(); enqueueNsByPtsUs.put(timestampUs, nowNs); noteInput(nowNs); } catch (Throwable ignored) {}
+            try { long nowNs = System.nanoTime(); enqueueNsByPtsUs.put(timestampUs, nowNs); noteInput(nowNs); noteHandoff(nowNs, timestampUs); } catch (Throwable ignored) {}
 
             // We need a new buffer now
             nextInputBufferIndex = -1;

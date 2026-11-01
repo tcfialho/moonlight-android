@@ -3970,7 +3970,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     public void onPerfUpdate(final String text) {
         // Tuned build: mirror the overlay to logcat so the stats can be read remotely over adb
         if ("tuned".equals(BuildConfig.BUILD_TYPE)) {
-            android.util.Log.i("TunedStats", text.replace('\n', '|'));
+            android.util.Log.i("TunedStats", text.replace('\n', '|') + String.format(java.util.Locale.US,
+                    "|Handoff: %.3f ms", com.limelight.binding.video.MediaCodecDecoderRenderer.takeTunedHandoffMs()));
         }
         if (!prefConfig.enablePerfOverlay) {
             return;
