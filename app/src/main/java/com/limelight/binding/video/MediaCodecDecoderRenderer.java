@@ -57,6 +57,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Toggle at runtime if needed
     // Decode latency tracking: map PTS(us) -> enqueue time (ns)
     private final LongSparseArray<Long> enqueueNsByPtsUs = new LongSparseArray<>();
+    private byte[] nativeInputFallback;
     private boolean asyncCodec;
     private volatile int codecCallbackGeneration;
     private HandlerThread codecCallbackThread;
@@ -2037,11 +2038,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
-    @SuppressWarnings("deprecation")
     @Override
-    public int submitDecodeUnit(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
+    public boolean supportsNativeInput() {
+        boolean enabled = TUNED_BUILD;
+        LimeLog.info("InputCopy direct=" + enabled);
+        return enabled;
+    }
+
+    @Override
+    public int submitNativeDecodeUnit(long handle, int length, int frameNumber, int frameType,
+                                      char hostLatency, long receiveMs, long enqueueMs) {
+        return submitDecodeUnitInternal(null, length, MoonBridge.BUFFER_TYPE_PICDATA, frameNumber,
+                frameType, hostLatency, receiveMs, enqueueMs, handle);
+    }
+
+    @Override
+    public int submitDecodeUnit(byte[] data, int length, int type, int frameNumber, int frameType,
+                                char hostLatency, long receiveMs, long enqueueMs) {
+        return submitDecodeUnitInternal(data, length, type, frameNumber, frameType, hostLatency,
+                receiveMs, enqueueMs, 0);
+    }
+
+    @SuppressWarnings("deprecation")
+    private int submitDecodeUnitInternal(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
                                 int frameNumber, int frameType, char frameHostProcessingLatency,
-                                long receiveTimeMs, long enqueueTimeMs) {
+                                long receiveTimeMs, long enqueueTimeMs, long nativeHandle) {
         if (stopping) {
             // Don't bother if we're stopping
             return MoonBridge.DR_OK;
@@ -2465,7 +2486,26 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         // Copy data from our buffer list into the input buffer
-        nextInputBuffer.put(decodeUnitData, 0, decodeUnitLength);
+        if (nativeHandle != 0 && nextInputBuffer.isReadOnly()) throw new java.nio.ReadOnlyBufferException();
+        if (nativeHandle == 0) {
+            nextInputBuffer.put(decodeUnitData, 0, decodeUnitLength);
+        } else {
+            int offset = nextInputBuffer.position();
+            int copied = MoonBridge.copyNativePicture(nativeHandle, nextInputBuffer, offset, decodeUnitLength);
+            if (copied == -1) {
+                // Non-direct codec buffers retain the original two-copy behavior.
+                if (nativeInputFallback == null || nativeInputFallback.length < decodeUnitLength) {
+                    nativeInputFallback = new byte[decodeUnitLength];
+                }
+                if (!MoonBridge.copyNativePictureToArray(nativeHandle, nativeInputFallback, decodeUnitLength)) {
+                    throw new IllegalArgumentException("Invalid native picture fragments");
+                }
+                nextInputBuffer.put(nativeInputFallback, 0, decodeUnitLength);
+            } else {
+                if (copied != decodeUnitLength) throw new IllegalArgumentException("Invalid native picture bounds");
+                nextInputBuffer.position(offset + copied);
+            }
+        }
 
         if (!queueNextInputBuffer(timestampUs, codecFlags)) {
             return MoonBridge.DR_NEED_IDR;

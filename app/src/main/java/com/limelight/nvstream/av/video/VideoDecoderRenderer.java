@@ -13,6 +13,11 @@ public abstract class VideoDecoderRenderer {
                                          int frameNumber, int frameType, char frameHostProcessingLatency,
                                          long receiveTimeMs, long enqueueTimeMs);
     
+    public boolean supportsNativeInput() { return false; }
+    public int submitNativeDecodeUnit(long handle, int length, int frameNumber, int frameType,
+                                      char hostLatency, long receiveMs, long enqueueMs) {
+        throw new UnsupportedOperationException("Native input not supported");
+    }
     public abstract void cleanup();
 
     public abstract int getCapabilities();

@@ -350,6 +350,14 @@ public class MoonBridge {
                                               int videoCapabilities,
                                               int colorSpace, int colorRange);
 
+    public static boolean bridgeDrSupportsNativeInput() { return videoRenderer != null && videoRenderer.supportsNativeInput(); }
+    public static int bridgeDrSubmitNativeDecodeUnit(long handle, int length, int frameNumber, int frameType,
+                                                    char hostLatency, long receiveMs, long enqueueMs) {
+        return videoRenderer == null ? DR_OK : videoRenderer.submitNativeDecodeUnit(handle, length, frameNumber, frameType, hostLatency, receiveMs, enqueueMs);
+    }
+    public static native int copyNativePicture(long handle, java.nio.ByteBuffer target, int offset, int length);
+    public static native boolean copyNativePictureToArray(long handle, byte[] target, int length);
+
     public static native void stopConnection();
 
     public static native void interruptConnection();

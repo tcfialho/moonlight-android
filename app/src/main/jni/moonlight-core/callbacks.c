@@ -22,6 +22,8 @@ static jmethodID BridgeDrStartMethod;
 static jmethodID BridgeDrStopMethod;
 static jmethodID BridgeDrCleanupMethod;
 static jmethodID BridgeDrSubmitDecodeUnitMethod;
+static jmethodID BridgeDrSubmitNativeMethod, BridgeDrSupportsNativeMethod;
+static bool UseNativeInput;
 static jmethodID BridgeArInitMethod;
 static jmethodID BridgeArStartMethod;
 static jmethodID BridgeArStopMethod;
@@ -81,6 +83,8 @@ JNIEXPORT void JNICALL
 Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
     (*env)->GetJavaVM(env, &JVM);
     GlobalBridgeClass = (*env)->NewGlobalRef(env, (*env)->FindClass(env, "com/limelight/nvstream/jni/MoonBridge"));
+    BridgeDrSupportsNativeMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrSupportsNativeInput", "()Z");
+    BridgeDrSubmitNativeMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrSubmitNativeDecodeUnit", "(JIIICJJ)I");
     BridgeDrSetupMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrSetup", "(IIII)I");
     BridgeDrStartMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrStart", "()V");
     BridgeDrStopMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrStop", "()V");
@@ -104,6 +108,19 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
     BridgeClSetControllerLEDMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetControllerLED", "(SBBB)V");
 }
 
+static bool ensureScratchArray(JNIEnv* env, int size) {
+    if (size < 0) return false;
+    if (DecodedFrameBuffer && (*env)->GetArrayLength(env, DecodedFrameBuffer) >= size) return true;
+    jbyteArray local = (*env)->NewByteArray(env, size);
+    if (!local) return false;
+    jbyteArray global = (*env)->NewGlobalRef(env, local);
+    (*env)->DeleteLocalRef(env, local);
+    if (!global) return false;
+    if (DecodedFrameBuffer) (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
+    DecodedFrameBuffer = global;
+    return true;
+}
+
 int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
     JNIEnv* env = GetThreadEnv();
     int err;
@@ -117,9 +134,10 @@ int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* 
         return err;
     }
 
-    // Use a 32K frame buffer that will increase if needed
-    DecodedFrameBuffer = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, 32768));
-
+    UseNativeInput = (*env)->CallStaticBooleanMethod(env, GlobalBridgeClass, BridgeDrSupportsNativeMethod);
+    if ((*env)->ExceptionCheck(env)) return -1;
+    // Picture bytes bypass this array; parameters retain the established Java path.
+    if (!ensureScratchArray(env, UseNativeInput ? 0 : 32768)) return -1;
     return 0;
 }
 
@@ -138,8 +156,8 @@ void BridgeDrStop(void) {
 void BridgeDrCleanup(void) {
     JNIEnv* env = GetThreadEnv();
 
-    (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
-
+    if (DecodedFrameBuffer) (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
+    DecodedFrameBuffer = NULL;
     (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrCleanupMethod);
 }
 
@@ -147,20 +165,15 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     JNIEnv* env = GetThreadEnv();
     int ret;
 
-    // Increase the size of our frame data buffer if our frame won't fit
-    if ((*env)->GetArrayLength(env, DecodedFrameBuffer) < decodeUnit->fullLength) {
-        (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
-        DecodedFrameBuffer = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, decodeUnit->fullLength));
-    }
-
+    if (!UseNativeInput && !ensureScratchArray(env, decodeUnit->fullLength)) return DR_NEED_IDR;
     PLENTRY currentEntry;
     int offset;
-
     currentEntry = decodeUnit->bufferList;
     offset = 0;
     while (currentEntry != NULL) {
         // Submit parameter set NALUs separately from picture data
         if (currentEntry->bufferType != BUFFER_TYPE_PICDATA) {
+            if (UseNativeInput && !ensureScratchArray(env, currentEntry->length)) return DR_NEED_IDR;
             // Use the beginning of the buffer each time since this is a separate
             // invocation of the decoder each time.
             (*env)->SetByteArrayRegion(env, DecodedFrameBuffer, 0, currentEntry->length, (jbyte*)currentEntry->data);
@@ -179,17 +192,26 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
             }
         }
         else {
-            (*env)->SetByteArrayRegion(env, DecodedFrameBuffer, offset, currentEntry->length, (jbyte*)currentEntry->data);
+            if (!UseNativeInput) {
+                (*env)->SetByteArrayRegion(env, DecodedFrameBuffer, offset, currentEntry->length, (jbyte*)currentEntry->data);
+            }
             offset += currentEntry->length;
         }
 
         currentEntry = currentEntry->next;
     }
 
+    if (UseNativeInput) {
+        ret = (*env)->CallStaticIntMethod(env, GlobalBridgeClass, BridgeDrSubmitNativeMethod,
+                (jlong)(uintptr_t)decodeUnit, offset, decodeUnit->frameNumber, decodeUnit->frameType,
+                (jchar)decodeUnit->frameHostProcessingLatency, (jlong)decodeUnit->receiveTimeMs,
+                (jlong)decodeUnit->enqueueTimeMs);
+    } else {
     ret = (*env)->CallStaticIntMethod(env, GlobalBridgeClass, BridgeDrSubmitDecodeUnitMethod,
                                        DecodedFrameBuffer, offset, BUFFER_TYPE_PICDATA,
                                        decodeUnit->frameNumber, decodeUnit->frameType, (jchar)decodeUnit->frameHostProcessingLatency,
                                        (jlong)decodeUnit->receiveTimeMs, (jlong)decodeUnit->enqueueTimeMs);
+    }
     if ((*env)->ExceptionCheck(env)) {
         // We will crash here
         (*JVM)->DetachCurrentThread(JVM);
@@ -200,6 +222,43 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     }
 }
 
+// A borrowed DU handle never escapes its synchronous native -> Java -> native call.
+static bool pictureFits(PDECODE_UNIT du, int length) {
+    if (!du || length < 0) return false;
+    int sum = 0;
+    for (PLENTRY e = du->bufferList; e; e = e->next) {
+        if (e->bufferType != BUFFER_TYPE_PICDATA) continue;
+        if (e->length < 0 || e->length > length - sum || (e->length && !e->data)) return false;
+        sum += e->length;
+    }
+    return sum == length;
+}
+static int copyPicture(PDECODE_UNIT du, unsigned char* dst, jlong capacity, int offset, int length) {
+    if (!dst || offset < 0 || capacity < 0 || offset > capacity || length < 0 || length > capacity-offset || !pictureFits(du,length)) return -2;
+    int wrote = 0;
+    for (PLENTRY e=du->bufferList;e;e=e->next) {
+        if (e->bufferType == BUFFER_TYPE_PICDATA && e->length) {
+            memcpy(dst+offset+wrote,e->data,e->length); wrote += e->length;
+        }
+    }
+    return wrote;
+}
+JNIEXPORT jint JNICALL Java_com_limelight_nvstream_jni_MoonBridge_copyNativePicture(JNIEnv* env,jclass clazz,jlong handle,jobject target,jint offset,jint length) {
+    unsigned char* dst=(*env)->GetDirectBufferAddress(env,target);
+    if (!dst) return -1;
+    return copyPicture((PDECODE_UNIT)(uintptr_t)handle,dst,(*env)->GetDirectBufferCapacity(env,target),offset,length);
+}
+JNIEXPORT jboolean JNICALL Java_com_limelight_nvstream_jni_MoonBridge_copyNativePictureToArray(JNIEnv* env,jclass clazz,jlong handle,jbyteArray target,jint length) {
+    PDECODE_UNIT du=(PDECODE_UNIT)(uintptr_t)handle;
+    if ((*env)->GetArrayLength(env,target)<length || !pictureFits(du,length)) return JNI_FALSE;
+    int offset=0;
+    for(PLENTRY e=du->bufferList;e;e=e->next) if(e->bufferType==BUFFER_TYPE_PICDATA && e->length) {
+        (*env)->SetByteArrayRegion(env,target,offset,e->length,(jbyte*)e->data);
+        if ((*env)->ExceptionCheck(env)) return JNI_FALSE;
+        offset+=e->length;
+    }
+    return JNI_TRUE;
+}
 int BridgeArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int flags) {
     JNIEnv* env = GetThreadEnv();
     int err;
