@@ -57,6 +57,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Toggle at runtime if needed
     // Decode latency tracking: map PTS(us) -> enqueue time (ns)
     private final LongSparseArray<Long> enqueueNsByPtsUs = new LongSparseArray<>();
+    private boolean asyncCodec;
+    private volatile int codecCallbackGeneration;
+    private HandlerThread codecCallbackThread;
+    private final java.util.concurrent.ArrayBlockingQueue<Integer> availableInputBuffers =
+            new java.util.concurrent.ArrayBlockingQueue<>(64);
+    private long outputReadyPtsUs = -1;
+    private long outputReadyNs;
 
     // When preferLowerDelays=true we use this configurable timeout (µs) for output dequeue.
 // When preferLowerDelays=false we force 0µs (non-blocking, latest-frame rendering).
@@ -103,6 +110,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     private void noteDequeued(int index, long presentationTimeUs) {
+        if (index >= 0) {
+            outputReadyPtsUs = presentationTimeUs;
+            outputReadyNs = System.nanoTime();
+        }
         if (!tracing() || index < 0) {
             return;
         }
@@ -110,8 +121,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         long nowNs = System.nanoTime();
         slotDequeueNs[slot] = nowNs;
         outputLogNs[outputLogCount++ % CADENCE_LOG_SIZE] = nowNs;
-        Long enqueueNs = enqueueNsByPtsUs.get(presentationTimeUs);
-        slotEnqueueNs[slot] = enqueueNs != null ? enqueueNs : 0L;
+        synchronized (enqueueNsByPtsUs) {
+            Long enqueueNs = enqueueNsByPtsUs.get(presentationTimeUs);
+            slotEnqueueNs[slot] = enqueueNs != null ? enqueueNs : 0L;
+        }
     }
 
     // Release a frame to the display at the given target time and, in the tuned build, trace it
@@ -205,10 +218,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     // Update stats using real decode time: enqueue->dequeue, instead of uptime - PTS
     private void updateDecodeLatencyStats(long presentationTimeUs) {
-        Long enqNs = enqueueNsByPtsUs.get(presentationTimeUs);
-        if (enqNs != null) {
+        Long enqNs;
+        synchronized (enqueueNsByPtsUs) {
+            enqNs = enqueueNsByPtsUs.get(presentationTimeUs);
             enqueueNsByPtsUs.delete(presentationTimeUs);
-            long decMs = (System.nanoTime() - enqNs) / 1_000_000L;
+        }
+        if (enqNs != null) {
+            long readyNs = outputReadyPtsUs == presentationTimeUs ? outputReadyNs : System.nanoTime();
+            long decMs = (readyNs - enqNs) / 1_000_000L;
             if (decMs >= 0 && decMs < 1000) {
                 activeWindowVideoStats.decoderTimeMs += decMs;
                 if (!USE_FRAME_RENDER_TIME) {
@@ -728,6 +745,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
+        String decoderName = videoDecoder.getName().toLowerCase(java.util.Locale.US);
+        // Keep the selected path scoped to the tuned MediaTek configuration tested on Fire TV.
+        asyncCodec = TUNED_BUILD && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                decoderName.startsWith("omx.mtk") &&
+                (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_10BIT) == 0;
+        if (asyncCodec) {
+            format.setInteger("vendor.mtk.vdec.input.max.queue.depth", 2);
+            format.setInteger("vendor.mtk.vdec.output.max.queue.depth", 2);
+            installCodecCallbacks();
+        }
+        LimeLog.info("Tuned decoder async=" + asyncCodec);
         LimeLog.info("Configuring with format: "+format);
 
         videoDecoder.configure(format, renderTarget, null, 0);
@@ -931,6 +959,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     // All threads that interact with the MediaCodec instance must call this function regularly!
     private boolean doCodecRecoveryIfRequired(int quiescenceFlag) {
+        // Callback-owned buffers must never enter the synchronous flush/reset protocol.
+        // End this stream cleanly; a new connection creates a fresh decoder.
+        if (asyncCodec && codecRecoveryType.get() != CR_RECOVERY_TYPE_NONE) {
+            failAsyncDecoder(new IllegalStateException("Async decoder requires a stream restart"));
+            codecRecoveryType.set(CR_RECOVERY_TYPE_NONE);
+            return true;
+        }
         // NB: We cannot check 'stopping' here because we could end up bailing in a partially
         // quiesced state that will cause the quiesced threads to never wake up.
         if (codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE) {
@@ -1079,6 +1114,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean handleDecoderException(IllegalStateException e) {
         // Eat decoder exceptions if we're in the process of stopping
         if (stopping) {
+            return false;
+        }
+
+        if (asyncCodec) {
+            failAsyncDecoder(e);
             return false;
         }
 
@@ -1274,6 +1314,94 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 Choreographer.getInstance().postFrameCallback(MediaCodecDecoderRenderer.this);
             }
         });
+    }
+
+    private synchronized void failAsyncDecoder(Exception error) {
+        stopping = true;
+        if (!reportedCrash) {
+            reportedCrash = true;
+            LimeLog.severe("Async decoder stopped: " + error);
+            crashListener.notifyCrash(error);
+            activity.runOnUiThread(() -> {
+                if (!activity.isFinishing()) activity.finish();
+            });
+        }
+    }
+
+    private void installCodecCallbacks() {
+        final int generation = ++codecCallbackGeneration;
+        availableInputBuffers.clear();
+        if (codecCallbackThread == null) {
+            codecCallbackThread = new HandlerThread("Video - Codec Callback", Process.THREAD_PRIORITY_DISPLAY);
+            codecCallbackThread.start();
+        }
+        videoDecoder.setCallback(new MediaCodec.Callback() {
+            @Override
+            public void onInputBufferAvailable(MediaCodec codec, int index) {
+                if (stopping || generation != codecCallbackGeneration || codec != videoDecoder) return;
+                if (!availableInputBuffers.offer(index)) {
+                    failAsyncDecoder(new IllegalStateException("Async decoder input queue overflow"));
+                }
+            }
+
+            @Override
+            public void onOutputBufferAvailable(MediaCodec codec, int index, BufferInfo info) {
+                if (stopping || generation != codecCallbackGeneration || codec != videoDecoder) return;
+                try {
+                    numFramesOut++;
+                    noteDequeued(index, info.presentationTimeUs);
+                    updateDecodeLatencyStats(info.presentationTimeUs);
+                    if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
+                        while (outputBufferQueue.size() >= OUTPUT_BUFFER_QUEUE_LIMIT) {
+                            Integer old = outputBufferQueue.poll();
+                            if (old != null) codec.releaseOutputBuffer(old, false);
+                        }
+                        outputBufferQueue.offer(index);
+                    } else {
+                        renderAt(index, System.nanoTime());
+                        activeWindowVideoStats.totalFramesRendered++;
+                    }
+                } catch (IllegalStateException e) {
+                    failAsyncDecoder(e);
+                }
+            }
+
+            @Override
+            public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
+                if (!stopping && generation == codecCallbackGeneration && codec == videoDecoder) {
+                    outputFormat = format;
+                }
+            }
+
+            @Override
+            public void onError(MediaCodec codec, CodecException error) {
+                if (!stopping && generation == codecCallbackGeneration && codec == videoDecoder) {
+                    failAsyncDecoder(error);
+                }
+            }
+        }, new Handler(codecCallbackThread.getLooper()));
+    }
+
+    private void stopCodecCallbacks() {
+        ++codecCallbackGeneration;
+        if (codecCallbackThread != null) {
+            codecCallbackThread.quitSafely();
+            if (Thread.currentThread() != codecCallbackThread) {
+                boolean interrupted = false;
+                while (codecCallbackThread.isAlive()) {
+                    try {
+                        codecCallbackThread.join();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }
+        availableInputBuffers.clear();
+        synchronized (enqueueNsByPtsUs) {
+            enqueueNsByPtsUs.clear();
+        }
     }
 
     private void startRendererThread()
@@ -1640,7 +1768,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         try {
             // If we don't have an input buffer index yet, fetch one now
             while (nextInputBufferIndex < 0 && !stopping) {
-                nextInputBufferIndex = videoDecoder.dequeueInputBuffer(10000);
+                if (asyncCodec) {
+                    try {
+                        Integer index = availableInputBuffers.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (index != null) nextInputBufferIndex = index;
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                } else {
+                    nextInputBufferIndex = videoDecoder.dequeueInputBuffer(10000);
+                }
             }
 
             // Get the backing ByteBuffer for the input buffer index
@@ -1703,7 +1841,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     @Override
     public void start() {
         active = this;
-        startRendererThread();
+        if (!asyncCodec) startRendererThread();
         startChoreographerThread();
     }
 
@@ -1759,7 +1897,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Wait for the renderer thread to shut down
         try {
-            rendererThread.join();
+            if (rendererThread != null) rendererThread.join();
+            stopCodecCallbacks();
         } catch (InterruptedException e) {
             e.printStackTrace();
 
@@ -1772,7 +1911,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void cleanup() {
-        videoDecoder.release();
+        stopping = true;
+        stopCodecCallbacks();
+        if (videoDecoder != null) videoDecoder.release();
     }
 
     @Override
@@ -1829,17 +1970,24 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         boolean codecRecovered;
 
         try {
+            // Register before submission: an async output may arrive before this call returns.
+            long nowNs = System.nanoTime();
+            synchronized (enqueueNsByPtsUs) {
+                enqueueNsByPtsUs.put(timestampUs, nowNs);
+            }
+            noteInput(nowNs);
+            noteHandoff(nowNs, timestampUs);
             videoDecoder.queueInputBuffer(nextInputBufferIndex,
                     0, nextInputBuffer.position(),
                     timestampUs, codecFlags);
-
-            // Track enqueue time for this PTS
-            try { long nowNs = System.nanoTime(); enqueueNsByPtsUs.put(timestampUs, nowNs); noteInput(nowNs); noteHandoff(nowNs, timestampUs); } catch (Throwable ignored) {}
 
             // We need a new buffer now
             nextInputBufferIndex = -1;
             nextInputBuffer = null;
         } catch (IllegalStateException e) {
+            synchronized (enqueueNsByPtsUs) {
+                enqueueNsByPtsUs.delete(timestampUs);
+            }
             if (handleDecoderException(e)) {
                 // We encountered a transient error. In this case, just hold onto the buffer
                 // (to avoid leaking it), clear it, and keep it for the next frame. We'll return
