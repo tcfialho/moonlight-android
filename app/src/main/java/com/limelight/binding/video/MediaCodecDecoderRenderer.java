@@ -58,6 +58,48 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Decode latency tracking: map PTS(us) -> enqueue time (ns)
     private final LongSparseArray<Long> enqueueNsByPtsUs = new LongSparseArray<>();
     private byte[] nativeInputFallback;
+    private Handler nativeOutputHandler;
+    private String nativeSelectedName;
+    private boolean nativeCodec;
+    private boolean nativeRequested() {
+        return TUNED_BUILD && Build.VERSION.SDK_INT >= 30;
+    }
+    @androidx.annotation.Keep
+    public void nativeFrameMetadata(int frameNumber, int frameType, char hostLatency, long receiveMs, long enqueueMs, long ptsUs) {
+        if (stopping || doCodecRecoveryIfRequired(CR_FLAG_INPUT_THREAD)) {
+            MoonBridge.nativeCodecPrepareStop();
+            return;
+        }
+        submitDecodeUnitInternal(null, 0, MoonBridge.BUFFER_TYPE_PICDATA, frameNumber, frameType, hostLatency, receiveMs, enqueueMs, -1);
+        long queuedNs = System.nanoTime();
+        synchronized (enqueueNsByPtsUs) { enqueueNsByPtsUs.put(ptsUs, queuedNs); }
+        noteInput(queuedNs); noteHandoff(queuedNs, ptsUs); numFramesIn++;
+    }
+    @androidx.annotation.Keep
+    public void nativeOutput(int index, long ptsUs) {
+        if (stopping) return;
+        if (!nativeOutputHandler.post(() -> nativeOutputOnHandler(index, ptsUs)) && !stopping)
+            failAsyncDecoder(new IllegalStateException("NDK output handler rejected frame"));
+    }
+    private void nativeOutputOnHandler(int index, long ptsUs) {
+        if (stopping) return;
+        try {
+            numFramesOut++; noteDequeued(index, ptsUs); updateDecodeLatencyStats(ptsUs);
+            if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
+                while (outputBufferQueue.size() >= OUTPUT_BUFFER_QUEUE_LIMIT) {
+                    Integer old = outputBufferQueue.poll();
+                    if (old != null) MoonBridge.nativeCodecRelease(old, -1);
+                }
+                outputBufferQueue.offer(index);
+            } else { renderAt(index, System.nanoTime()); activeWindowVideoStats.totalFramesRendered++; }
+        } catch (IllegalStateException e) { failAsyncDecoder(e); }
+    }
+    @androidx.annotation.Keep
+    public void nativeCodecError(String error) { if (!stopping) failAsyncDecoder(new IllegalStateException(error)); }
+    private void releaseOutput(int index, boolean render) {
+        if (nativeCodec) MoonBridge.nativeCodecRelease(index, render ? System.nanoTime() : -1);
+        else videoDecoder.releaseOutputBuffer(index, render);
+    }
     private boolean asyncCodec;
     private volatile int codecCallbackGeneration;
     private HandlerThread codecCallbackThread;
@@ -131,7 +173,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Release a frame to the display at the given target time and, in the tuned build, trace it
     private void renderAt(int index, long targetNs) {
         long callNs = System.nanoTime();
-        videoDecoder.releaseOutputBuffer(index, targetNs);
+        if (nativeCodec) MoonBridge.nativeCodecRelease(index, targetNs);
+        else videoDecoder.releaseOutputBuffer(index, targetNs);
         if (tracing()) {
             int slot = index & (OUT_SLOTS - 1);
             synchronized (logTargetNs) {
@@ -191,14 +234,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             long now = System.nanoTime();
             boolean immediate = preferLowerDelays && (frameTimeNanos <= now + 300_000L);
             if (immediate && !TUNED_BUILD) {
-                videoDecoder.releaseOutputBuffer(bufferIndex, true);
+                releaseOutput(bufferIndex, true);
             } else {
                 renderAt(bufferIndex, immediate ? now : frameTimeNanos);
             }
         } catch (Throwable t) {
             try {
                 // Fallback to immediate if timestamped release fails for any reason
-                videoDecoder.releaseOutputBuffer(bufferIndex, true);
+                releaseOutput(bufferIndex, true);
             } catch (Throwable ignored) {}
         }
     }
@@ -746,7 +789,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
-        String decoderName = videoDecoder.getName().toLowerCase(java.util.Locale.US);
+        String decoderName = (nativeSelectedName != null ? nativeSelectedName : videoDecoder.getName()).toLowerCase(java.util.Locale.US);
         // Keep the selected path scoped to the tuned MediaTek configuration tested on Fire TV.
         asyncCodec = TUNED_BUILD && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                 decoderName.startsWith("omx.mtk") &&
@@ -754,11 +797,39 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (asyncCodec) {
             format.setInteger("vendor.mtk.vdec.input.max.queue.depth", 2);
             format.setInteger("vendor.mtk.vdec.output.max.queue.depth", 2);
-            installCodecCallbacks();
+            if (nativeSelectedName == null) installCodecCallbacks();
         }
         LimeLog.info("Tuned decoder async=" + asyncCodec);
         LimeLog.info("Configuring with format: "+format);
 
+        nativeCodec = nativeRequested() && asyncCodec &&
+                (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0;
+        LimeLog.info("NativeCodec enabled=" + nativeCodec);
+        if (nativeCodec) {
+            codecCallbackThread = new HandlerThread("Video - Codec Callback", Process.THREAD_PRIORITY_DISPLAY);
+            codecCallbackThread.start();
+            nativeOutputHandler = new Handler(codecCallbackThread.getLooper());
+            String name = nativeSelectedName;
+            String[] keys = format.getKeys().toArray(new String[0]);
+            String[] values = new String[keys.length];
+            int[] types = new int[keys.length];
+            for (int i=0; i<keys.length; ++i) {
+                types[i] = format.getValueTypeForKey(keys[i]);
+                switch(types[i]) {
+                    case MediaFormat.TYPE_INTEGER: values[i] = Integer.toString(format.getInteger(keys[i])); break;
+                    case MediaFormat.TYPE_LONG: values[i] = Long.toString(format.getLong(keys[i])); break;
+                    case MediaFormat.TYPE_FLOAT: values[i] = Float.toString(format.getFloat(keys[i])); break;
+                    case MediaFormat.TYPE_STRING: values[i] = format.getString(keys[i]); break;
+                    default: throw new IllegalArgumentException("Unsupported native format key " + keys[i]);
+                }
+            }
+            if (!MoonBridge.nativeCodecCreate(name, renderTarget, keys, types, values, this, fusedIdrFrame))
+                throw new IllegalStateException("NDK decoder setup failed");
+            try { applySurfaceFrameRate(renderTarget, targetFps); } catch (Throwable ignored) {}
+            configuredFormat = format; inputFormat = format;
+            submittedCsd = false; vpsBuffers.clear(); spsBuffers.clear(); ppsBuffers.clear();
+            return;
+        }
         videoDecoder.configure(format, renderTarget, null, 0);
 
         try { applySurfaceFrameRate(renderTarget, targetFps); } catch (Throwable ignored) {}
@@ -810,7 +881,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean tryConfigureDecoder(MediaCodecInfo selectedDecoderInfo, MediaFormat format, boolean throwOnCodecError) {
         boolean configured = false;
         try {
-            videoDecoder = MediaCodec.createByCodecName(selectedDecoderInfo.getName());
+            nativeSelectedName = nativeRequested() && selectedDecoderInfo.getName().toLowerCase(java.util.Locale.US).startsWith("omx.mtk") &&
+                (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0 && (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_10BIT) == 0 ? selectedDecoderInfo.getName() : null;
+            if (nativeSelectedName == null) videoDecoder = MediaCodec.createByCodecName(selectedDecoderInfo.getName());
             configureAndStartDecoder(format);
             LimeLog.info("Using codec " + selectedDecoderInfo.getName() + " for hardware decoding " + format.getString(MediaFormat.KEY_MIME));
             configured = true;
@@ -830,6 +903,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 throw new RuntimeException(e);
             }
         } finally {
+            if (!configured && nativeCodec) {
+                MoonBridge.nativeCodecClose();
+                nativeCodec = false;
+                stopCodecCallbacks();
+            }
             if (!configured && videoDecoder != null) {
                 videoDecoder.release();
                 videoDecoder = null;
@@ -1279,7 +1357,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 } catch (IllegalStateException ignored) {
                     try {
                         // Try to avoid leaking the output buffer by releasing it without rendering
-                        videoDecoder.releaseOutputBuffer(nextOutputBuffer, false);
+                        releaseOutput(nextOutputBuffer, false);
                     } catch (IllegalStateException e) {
                         // This will leak nextOutputBuffer, but there's really nothing else we can do
                         e.printStackTrace();
@@ -1475,7 +1553,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             while (__idx >= 0) {
                                 noteDequeued(__idx, __tmpInfo.presentationTimeUs);
                                 if (__last >= 0) {
-                                    try { videoDecoder.releaseOutputBuffer(__last, false); } catch (Throwable ignored) {}
+                                    try { releaseOutput(__last, false); } catch (Throwable ignored) {}
                                 }
                                 __last = __idx;
                                 __lastPtsUs = __tmpInfo.presentationTimeUs;
@@ -1541,7 +1619,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // Get the last output buffer in the queue
                                 while ((outIndex = videoDecoder.dequeueOutputBuffer(info, drainTimeoutUs())) >= 0) {
                                     noteDequeued(outIndex, info.presentationTimeUs);
-                                    videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                    releaseOutput(lastIndex, false);
                                     frameDropped = true; // we're discarding the oldest one
 
                                     numFramesOut++;
@@ -1568,7 +1646,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                                 // ULL: present at next VSYNC (no scheduling)
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                                 // Smooth/Balanced: keep timestamp scheduling
-                                                videoDecoder.releaseOutputBuffer(lastIndex, /* render */ false);
+                                                releaseOutput(lastIndex, false);
                                             }
 
                                             frameDropped = true;
@@ -1598,7 +1676,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             if (android.os.Build.VERSION.SDK_INT >= 21) {
                                                 long __ts = System.nanoTime();
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
-                                                videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                                releaseOutput(lastIndex, false);
                                             }
                                         }
 
@@ -1641,7 +1719,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                                 // ULL: present at next VSYNC (no scheduling)
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
                                                 // Smooth/Balanced: keep timestamp scheduling
-                                                videoDecoder.releaseOutputBuffer(lastIndex, /* render */ false);
+                                                releaseOutput(lastIndex, false);
                                             }
 
                                             frameDropped = true;
@@ -1672,7 +1750,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                             if (android.os.Build.VERSION.SDK_INT >= 21) {
                                                 long __ts = System.nanoTime();
                                                 releaseWithPolicy(lastIndex, System.nanoTime());} else {
-                                                videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                                releaseOutput(lastIndex, false);
                                             }
                                         }
 
@@ -1695,7 +1773,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // refresh rate).
                                 if (outputBufferQueue.size() == OUTPUT_BUFFER_QUEUE_LIMIT) {
                                     try {
-                                        videoDecoder.releaseOutputBuffer(outputBufferQueue.take(), false);
+                                        releaseOutput(outputBufferQueue.take(), false);
                                         frameDropped = true;
                                     } catch (InterruptedException e) {
                                         return;
@@ -1814,7 +1892,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (codecRecovered) {
             return false;
         }
-
         int deltaMs = (int)(SystemClock.uptimeMillis() - startTime);
 
         if (deltaMs >= 20) {
@@ -1850,6 +1927,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     public void prepareForStop() {
         // Let the decoding code know to ignore codec exceptions now
         stopping = true;
+        if (nativeCodec) MoonBridge.nativeCodecPrepareStop();
 
         // Halt the rendering thread
         if (rendererThread != null) {
@@ -1914,6 +1992,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     public void cleanup() {
         stopping = true;
         stopCodecCallbacks();
+        if (nativeCodec) { MoonBridge.nativeCodecClose(); nativeCodec = false; }
         if (videoDecoder != null) videoDecoder.release();
     }
 
@@ -2214,7 +2293,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         boolean csdSubmittedForThisFrame = false;
 
         // IDR frames require special handling for CSD buffer submission
-        if (frameType == MoonBridge.FRAME_TYPE_IDR) {
+        if (nativeHandle != -1 && frameType == MoonBridge.FRAME_TYPE_IDR) {
             // H264 SPS
             if (decodeUnitType == MoonBridge.BUFFER_TYPE_SPS && (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
                 numSpsIn++;
@@ -2442,6 +2521,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             activeWindowVideoStats.totalTimeMs += enqueueTimeMs - receiveTimeMs;
         }
 
+        if (nativeHandle == -1) return MoonBridge.DR_OK;
         if (!fetchNextInputBuffer()) {
             return MoonBridge.DR_NEED_IDR;
         }

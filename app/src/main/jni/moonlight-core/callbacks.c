@@ -1,4 +1,11 @@
 #include <jni.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <stdatomic.h>
+static int nativeSubmit(void* du);
+static bool nativeCodecActive(void);
+
 
 #include <pthread.h>
 #include <string.h>
@@ -162,6 +169,7 @@ void BridgeDrCleanup(void) {
 }
 
 int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
+    if (nativeCodecActive()) return nativeSubmit(decodeUnit);
     JNIEnv* env = GetThreadEnv();
     int ret;
 
@@ -243,6 +251,8 @@ static int copyPicture(PDECODE_UNIT du, unsigned char* dst, jlong capacity, int 
     }
     return wrote;
 }
+#include "native_codec.inc"
+
 JNIEXPORT jint JNICALL Java_com_limelight_nvstream_jni_MoonBridge_copyNativePicture(JNIEnv* env,jclass clazz,jlong handle,jobject target,jint offset,jint length) {
     unsigned char* dst=(*env)->GetDirectBufferAddress(env,target);
     if (!dst) return -1;

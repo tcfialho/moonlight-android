@@ -63,7 +63,7 @@ LOCAL_CFLAGS += -march=armv8-a+crc -mtune=cortex-a55 -mfpu=crypto-neon-fp-armv8
 endif
 endif
 
-LOCAL_LDLIBS := -llog
+LOCAL_LDLIBS := -llog -lmediandk -landroid -ldl
 
 LOCAL_STATIC_LIBRARIES := libopus libssl libcrypto cpufeatures
 LOCAL_LDFLAGS += -Wl,--exclude-libs,ALL
