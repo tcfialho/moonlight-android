@@ -76,15 +76,24 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         noteInput(queuedNs); noteHandoff(queuedNs, ptsUs); numFramesIn++;
     }
     @androidx.annotation.Keep
-    public void nativeOutput(int index, long ptsUs) {
+    public void nativeOutput(int index, long ptsUs, long readyNs, long releaseNs) {
         if (stopping) return;
-        if (!nativeOutputHandler.post(() -> nativeOutputOnHandler(index, ptsUs)) && !stopping)
+        // Native worker already released the buffer. Reuse that worker for bookkeeping;
+        // avoid a second wakeup and allocation solely to update statistics.
+        if (releaseNs != 0) { nativeOutputOnHandler(index, ptsUs, readyNs, releaseNs); return; }
+        if (!nativeOutputHandler.post(() -> nativeOutputOnHandler(index, ptsUs, readyNs, releaseNs)) && !stopping)
             failAsyncDecoder(new IllegalStateException("NDK output handler rejected frame"));
     }
-    private void nativeOutputOnHandler(int index, long ptsUs) {
+    private void nativeOutputOnHandler(int index, long ptsUs, long readyNs, long releaseNs) {
         if (stopping) return;
         try {
-            numFramesOut++; noteDequeued(index, ptsUs); updateDecodeLatencyStats(ptsUs);
+            numFramesOut++; noteDequeued(index, ptsUs, readyNs); updateDecodeLatencyStats(ptsUs);
+            if (releaseNs != 0) {
+                // The index was already released by the native worker; keep the existing opt-in trace.
+                if (tracing()) recordRender(index, releaseNs, releaseNs);
+                activeWindowVideoStats.totalFramesRendered++;
+                return;
+            }
             if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
                 while (outputBufferQueue.size() >= OUTPUT_BUFFER_QUEUE_LIMIT) {
                     Integer old = outputBufferQueue.poll();
@@ -153,15 +162,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     private void noteDequeued(int index, long presentationTimeUs) {
+        noteDequeued(index, presentationTimeUs, System.nanoTime());
+    }
+
+    private void noteDequeued(int index, long presentationTimeUs, long readyNs) {
         if (index >= 0) {
             outputReadyPtsUs = presentationTimeUs;
-            outputReadyNs = System.nanoTime();
+            outputReadyNs = readyNs;
         }
         if (!tracing() || index < 0) {
             return;
         }
         int slot = index & (OUT_SLOTS - 1);
-        long nowNs = System.nanoTime();
+        long nowNs = readyNs;
         slotDequeueNs[slot] = nowNs;
         outputLogNs[outputLogCount++ % CADENCE_LOG_SIZE] = nowNs;
         synchronized (enqueueNsByPtsUs) {
@@ -175,7 +188,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         long callNs = System.nanoTime();
         if (nativeCodec) MoonBridge.nativeCodecRelease(index, targetNs);
         else videoDecoder.releaseOutputBuffer(index, targetNs);
-        if (tracing()) {
+        if (tracing()) recordRender(index, targetNs, callNs);
+    }
+
+    private void recordRender(int index, long targetNs, long callNs) {
             int slot = index & (OUT_SLOTS - 1);
             synchronized (logTargetNs) {
                 int at = frameLogCount % FRAME_LOG_SIZE;
@@ -185,7 +201,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 logEnqueueNs[at] = slotEnqueueNs[slot];
                 frameLogCount++;
             }
-        }
     }
 
     private static void appendCadence(java.util.List<String> lines, String tag, long[] ring, int count, int maxFrames) {
@@ -806,9 +821,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0;
         LimeLog.info("NativeCodec enabled=" + nativeCodec);
         if (nativeCodec) {
-            codecCallbackThread = new HandlerThread("Video - Codec Callback", Process.THREAD_PRIORITY_DISPLAY);
-            codecCallbackThread.start();
-            nativeOutputHandler = new Handler(codecCallbackThread.getLooper());
+            boolean directOutput = prefs.framePacing == PreferenceConfiguration.FRAME_PACING_MIN_LATENCY;
+            if (!directOutput) {
+                codecCallbackThread = new HandlerThread("Video - Codec Callback", Process.THREAD_PRIORITY_DISPLAY);
+                codecCallbackThread.start();
+                nativeOutputHandler = new Handler(codecCallbackThread.getLooper());
+            }
             String name = nativeSelectedName;
             String[] keys = format.getKeys().toArray(new String[0]);
             String[] values = new String[keys.length];
@@ -823,7 +841,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     default: throw new IllegalArgumentException("Unsupported native format key " + keys[i]);
                 }
             }
-            if (!MoonBridge.nativeCodecCreate(name, renderTarget, keys, types, values, this, fusedIdrFrame))
+            if (!MoonBridge.nativeCodecCreate(name, renderTarget, keys, types, values, this, fusedIdrFrame, directOutput))
                 throw new IllegalStateException("NDK decoder setup failed");
             try { applySurfaceFrameRate(renderTarget, targetFps); } catch (Throwable ignored) {}
             configuredFormat = format; inputFormat = format;

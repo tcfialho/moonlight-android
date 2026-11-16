@@ -1,11 +1,14 @@
 // NDK input backend for the tuned MediaTek HEVC SDR configuration.
-// Input submission is native; output callbacks post to the Java pacing thread.
+// Latency mode releases output on a native worker; other pacing modes use Java.
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
 
 typedef media_status_t (*SetAsyncFn)(AMediaCodec*, AMediaCodecOnAsyncNotifyCallback, void*);
 static struct {
@@ -18,14 +21,25 @@ static struct {
     int inputs[64], head, count, held;
     uint8_t* inputData; size_t inputCapacity;
     _Atomic bool stopping;
-    bool started, initialized, fused, submittedCsd;
+    bool started, initialized, fused, submittedCsd, directOutput;
+    pthread_mutex_t outputLock;
+    pthread_cond_t outputReady;
+    pthread_t outputThread;
+    bool outputStarted;
+    struct {int index;int64_t pts, readyNs;} outputs[64];
+    int outputHead, outputCount;
     int64_t lastPts;
     SetAsyncFn setAsync;
 } nc;
+static int64_t nativeMonotonicNs(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (int64_t)t.tv_sec*1000000000LL+t.tv_nsec;
+}
 static bool nativeCodecActive(void) { return nc.codec != NULL; }
 static void nativeError(const char* message) {
     atomic_store(&nc.stopping,true);
     pthread_mutex_lock(&nc.lock); pthread_cond_broadcast(&nc.ready); pthread_mutex_unlock(&nc.lock);
+    pthread_mutex_lock(&nc.outputLock);pthread_cond_broadcast(&nc.outputReady);pthread_mutex_unlock(&nc.outputLock);
     JNIEnv* env=GetThreadEnv();
     jstring s=(*env)->NewStringUTF(env,message);
     if(s) { (*env)->CallVoidMethod(env,nc.renderer,nc.error,s); (*env)->DeleteLocalRef(env,s); }
@@ -40,12 +54,44 @@ static void inputAvailable(AMediaCodec* codec,void* u,int32_t index) {
     pthread_mutex_unlock(&nc.lock);
     if(overflow) nativeError("NDK input queue overflow");
 }
+static void notifyOutput(int index,int64_t pts,int64_t readyNs,int64_t releaseNs) {
+    JNIEnv* env=GetThreadEnv();
+    (*env)->CallVoidMethod(env,nc.renderer,nc.output,index,(jlong)pts,(jlong)readyNs,(jlong)releaseNs);
+    if((*env)->ExceptionCheck(env)) {(*env)->ExceptionDescribe(env);(*env)->ExceptionClear(env);nativeError("NDK output callback exception");}
+}
+static void* nativeOutputWorker(void* unused) {
+    (void)unused;
+    pthread_setname_np(pthread_self(),"VideoOutNative");
+    // Match the existing Java codec Handler's DISPLAY priority.
+    setpriority(PRIO_PROCESS,0,-4);
+    for(;;) {
+        pthread_mutex_lock(&nc.outputLock);
+        while(!nc.outputCount&&!atomic_load(&nc.stopping))pthread_cond_wait(&nc.outputReady,&nc.outputLock);
+        if(atomic_load(&nc.stopping)){pthread_mutex_unlock(&nc.outputLock);return NULL;}
+        int slot=nc.outputHead,index=nc.outputs[slot].index;
+        int64_t pts=nc.outputs[slot].pts,readyNs=nc.outputs[slot].readyNs;
+        nc.outputHead=(slot+1)&63;nc.outputCount--;
+        pthread_mutex_unlock(&nc.outputLock);
+        int64_t start=nativeMonotonicNs();
+        media_status_t status=AMediaCodec_releaseOutputBufferAtTime(nc.codec,index,start);
+        if(status!=AMEDIA_OK){if(!atomic_load(&nc.stopping))nativeError("NDK native worker release failed");return NULL;}
+        // Telemetry is deliberately asynchronous and never owns the released buffer.
+        if(!atomic_load(&nc.stopping))notifyOutput(index,pts,readyNs,start);
+    }
+}
 static void outputAvailable(AMediaCodec* codec,void* u,int32_t index,AMediaCodecBufferInfo* info) {
     (void)codec;(void)u;
+    int64_t readyNs=nativeMonotonicNs();
     if(atomic_load(&nc.stopping)) return;
-    JNIEnv* env=GetThreadEnv();
-    (*env)->CallVoidMethod(env,nc.renderer,nc.output,index,(jlong)info->presentationTimeUs);
-    if((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); nativeError("NDK output callback exception"); }
+    int64_t pts=info->presentationTimeUs;
+    if(nc.directOutput) {
+        pthread_mutex_lock(&nc.outputLock);
+        bool full=nc.outputCount==64;
+        if(!full){int slot=(nc.outputHead+nc.outputCount)&63;nc.outputs[slot].index=index;nc.outputs[slot].pts=pts;nc.outputs[slot].readyNs=readyNs;
+            if(nc.outputCount++==0)pthread_cond_signal(&nc.outputReady);}
+        pthread_mutex_unlock(&nc.outputLock);
+        if(full){nativeError("NDK output queue overflow");return;}
+    } else notifyOutput(index,pts,readyNs,0);
 }
 static void formatChanged(AMediaCodec* codec,void* u,AMediaFormat* f) {
     (void)codec;(void)u;
@@ -60,9 +106,11 @@ JNIEXPORT void JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecPre
     if(!nc.initialized) return;
     atomic_store(&nc.stopping,true);
     pthread_mutex_lock(&nc.lock); pthread_cond_broadcast(&nc.ready); pthread_mutex_unlock(&nc.lock);
+    pthread_mutex_lock(&nc.outputLock);pthread_cond_broadcast(&nc.outputReady);pthread_mutex_unlock(&nc.outputLock);
 }
 JNIEXPORT void JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecClose(JNIEnv* env,jclass c) {
     Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecPrepareStop(env,c);
+    if(nc.outputStarted){pthread_join(nc.outputThread,NULL);nc.outputStarted=false;}
     if(nc.codec) {
         if(nc.started) AMediaCodec_stop(nc.codec);
         AMediaCodecOnAsyncNotifyCallback empty={0};
@@ -71,19 +119,20 @@ JNIEXPORT void JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecClo
     }
     if(nc.renderer) (*env)->DeleteGlobalRef(env,nc.renderer);
     if(nc.window) ANativeWindow_release(nc.window);
-    if(nc.initialized) { pthread_mutex_destroy(&nc.lock); pthread_cond_destroy(&nc.ready); }
+    if(nc.initialized) { pthread_mutex_destroy(&nc.lock); pthread_cond_destroy(&nc.ready);pthread_mutex_destroy(&nc.outputLock);pthread_cond_destroy(&nc.outputReady); }
     memset(&nc,0,sizeof(nc));
 }
-JNIEXPORT jboolean JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecCreate(JNIEnv* env,jclass c,jstring name,jobject surface,jobjectArray keys,jintArray types,jobjectArray values,jobject renderer,jboolean fused) {
+JNIEXPORT jboolean JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCodecCreate(JNIEnv* env,jclass c,jstring name,jobject surface,jobjectArray keys,jintArray types,jobjectArray values,jobject renderer,jboolean fused,jboolean directOutput) {
     if(nc.initialized) return JNI_FALSE;
-    memset(&nc,0,sizeof(nc)); nc.held=-1; nc.fused=fused;
-    pthread_mutex_init(&nc.lock,NULL);
+    memset(&nc,0,sizeof(nc)); nc.held=-1; nc.fused=fused; nc.directOutput=directOutput;
+    __android_log_print(ANDROID_LOG_INFO,"LimeLog","Native output worker enabled=%d",nc.directOutput);
+    pthread_mutex_init(&nc.lock,NULL);pthread_mutex_init(&nc.outputLock,NULL);pthread_cond_init(&nc.outputReady,NULL);
     pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca,CLOCK_MONOTONIC);
     pthread_cond_init(&nc.ready,&ca); pthread_condattr_destroy(&ca); nc.initialized=true;
     nc.renderer=(*env)->NewGlobalRef(env,renderer);
     jclass cls=(*env)->GetObjectClass(env,renderer);
     nc.metadata=(*env)->GetMethodID(env,cls,"nativeFrameMetadata","(IICJJJ)V");
-    nc.output=(*env)->GetMethodID(env,cls,"nativeOutput","(IJ)V");
+    nc.output=(*env)->GetMethodID(env,cls,"nativeOutput","(IJJJ)V");
     nc.error=(*env)->GetMethodID(env,cls,"nativeCodecError","(Ljava/lang/String;)V");
     (*env)->DeleteLocalRef(env,cls);
     if(!nc.renderer||!nc.metadata||!nc.output||!nc.error) goto fail;
@@ -117,6 +166,7 @@ JNIEXPORT jboolean JNICALL Java_com_limelight_nvstream_jni_MoonBridge_nativeCode
     if(status==AMEDIA_OK) status=AMediaCodec_configure(nc.codec,f,nc.window,NULL,0);
     AMediaFormat_delete(f);
     if(status!=AMEDIA_OK) goto fail;
+    if(nc.directOutput){if(pthread_create(&nc.outputThread,NULL,nativeOutputWorker,NULL)!=0)goto fail;nc.outputStarted=true;}
     status=AMediaCodec_start(nc.codec);
     if(status!=AMEDIA_OK) goto fail;
     nc.started=true;

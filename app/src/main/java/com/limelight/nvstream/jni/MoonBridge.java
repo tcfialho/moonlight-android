@@ -358,7 +358,7 @@ public class MoonBridge {
     public static native int copyNativePicture(long handle, java.nio.ByteBuffer target, int offset, int length);
     public static native boolean copyNativePictureToArray(long handle, byte[] target, int length);
 
-    public static native boolean nativeCodecCreate(String name, android.view.Surface surface, String[] keys, int[] types, String[] values, com.limelight.binding.video.MediaCodecDecoderRenderer renderer, boolean fused);
+    public static native boolean nativeCodecCreate(String name, android.view.Surface surface, String[] keys, int[] types, String[] values, com.limelight.binding.video.MediaCodecDecoderRenderer renderer, boolean fused, boolean nativeOutput);
     public static native void nativeCodecPrepareStop();
     public static native void nativeCodecClose();
     public static native void nativeCodecRelease(int index, long targetNs);
