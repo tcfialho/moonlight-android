@@ -85,10 +85,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             } else if (!"status".equals(action)) {
                 throw new IllegalArgumentException("action must be on, off or status");
             }
+            boolean streamActive = isStatsStreamActive();
+            if (!streamActive) {
+                remoteStats.stop();
+                if ("on".equals(action)) throw new IllegalStateException("no_stream");
+            }
             long now = SystemClock.elapsedRealtime();
             RemoteStatsSession.Session session = remoteStats.current(now);
             org.json.JSONObject result = new org.json.JSONObject();
-            result.put("stream_active", isStatsStreamActive());
+            result.put("stream_active", streamActive);
             result.put("renderer_id", rendererId);
             result.put("active", session != null);
             result.put("session_id", session == null ? org.json.JSONObject.NULL : session.id);
