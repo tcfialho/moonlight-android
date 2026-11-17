@@ -117,11 +117,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
-    private void emitRemoteStats(RemoteStatsSession.Session session, String text, long startUptimeMs, long endUptimeMs) {
+    private void emitRemoteStats(RemoteStatsSession.Session session, String text, long startUptimeMs, long endUptimeMs, double handoffMs) {
         synchronized (remoteStats) {
             if (stopping || remoteStats.current(SystemClock.elapsedRealtime()) != session) return;
-            double handoffMs = session.handoffCount == 0 ? -1 : session.handoffSumNs / 1e6 / session.handoffCount;
-            session.handoffSumNs = session.handoffCount = 0;
             android.util.Log.i("TunedStats", "Session:" + session.id + "|SampleNs:" + System.nanoTime()
                     + "|WindowStartUptimeMs:" + startUptimeMs + "|WindowEndUptimeMs:" + endUptimeMs + "|"
                     + text.replace('\n', '|') + String.format(java.util.Locale.US, "|Handoff: %.3f ms", handoffMs));
@@ -2268,6 +2266,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // Flip stats windows roughly every second
         if (SystemClock.uptimeMillis() >= activeWindowVideoStats.measurementStartTimestamp + 1000) {
             RemoteStatsSession.Session session = inputStatsSession;
+            double handoffMs = -1;
+            if (session != null) {
+                handoffMs = session.handoffCount == 0 ? -1 : session.handoffSumNs / 1e6 / session.handoffCount;
+                session.handoffSumNs = session.handoffCount = 0;
+            }
             long windowStart = lastWindowVideoStats.measurementStartTimestamp != 0
                     ? lastWindowVideoStats.measurementStartTimestamp : activeWindowVideoStats.measurementStartTimestamp;
             boolean remoteReady = session != null
@@ -2379,7 +2382,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 }
                 String fullLog = sb.toString();
                 if (prefs.enablePerfOverlay) perfListener.onPerfUpdate(fullLog);
-                if (remoteReady) emitRemoteStats(session, fullLog, windowStart, SystemClock.uptimeMillis());
+                if (remoteReady) emitRemoteStats(session, fullLog, windowStart, SystemClock.uptimeMillis(), handoffMs);
                 // Best latency is only met at requested highest fps, rest can be ignored
                 Boolean targetFpsMatched = ((int) fps.totalFps == (int) prefs.fps);
                 if(minDecodeTime > decodeTimeMs && targetFpsMatched) {
