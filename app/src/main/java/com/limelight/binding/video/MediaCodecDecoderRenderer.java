@@ -56,7 +56,78 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     public void setForceTightThresholds(boolean v) { this.forceTightThresholds = v; }
     // Toggle at runtime if needed
     // Decode latency tracking: map PTS(us) -> enqueue time (ns)
-    private final LongSparseArray<Long> enqueueNsByPtsUs = new LongSparseArray<>();
+    private final LongSparseArray<FrameTiming> enqueueNsByPtsUs = new LongSparseArray<>();
+    private static final class FrameTiming {
+        final long queuedNs;
+        final RemoteStatsSession.Session session;
+        FrameTiming(long queuedNs, RemoteStatsSession.Session session) {
+            this.queuedNs = queuedNs;
+            this.session = session;
+        }
+    }
+    private final RemoteStatsSession remoteStats = new RemoteStatsSession();
+    private RemoteStatsSession.Session inputStatsSession;
+    private final boolean timingRequiredByPrefs;
+    private volatile boolean captureTimings;
+    private volatile long networkFramesLost;
+    private final String rendererId = android.os.Process.myPid() + "-" + System.nanoTime();
+
+    public boolean isStatsStreamActive() { return !stopping && active == this; }
+
+    public org.json.JSONObject statsCommand(String action, int seconds) throws org.json.JSONException {
+        synchronized (remoteStats) {
+            if ("on".equals(action)) {
+                if (!isStatsStreamActive()) throw new IllegalStateException("no_stream");
+                remoteStats.start(rendererId + "-" + System.nanoTime(), seconds,
+                        SystemClock.elapsedRealtime(), SystemClock.uptimeMillis());
+            } else if ("off".equals(action)) {
+                remoteStats.stop();
+            } else if (!"status".equals(action)) {
+                throw new IllegalArgumentException("action must be on, off or status");
+            }
+            long now = SystemClock.elapsedRealtime();
+            RemoteStatsSession.Session session = remoteStats.current(now);
+            org.json.JSONObject result = new org.json.JSONObject();
+            result.put("stream_active", isStatsStreamActive());
+            result.put("renderer_id", rendererId);
+            result.put("active", session != null);
+            result.put("session_id", session == null ? org.json.JSONObject.NULL : session.id);
+            result.put("remaining_ms", session == null ? 0 : session.expiresElapsedMs - now);
+            result.put("started_elapsed_ms", session == null ? 0 : session.startedElapsedMs);
+            result.put("warming_up", session != null && now - session.startedElapsedMs < RemoteStatsSession.WARMUP_MS);
+            // Independently published counters, not an atomic frame cohort. No collector is enabled by status.
+            result.put("frames_in", numFramesIn);
+            result.put("frames_out", numFramesOut);
+            result.put("network_frames_lost", networkFramesLost);
+            result.put("clock_ns", System.nanoTime());
+            return result;
+        }
+    }
+
+    private void refreshStatsCapture() {
+        RemoteStatsSession.Session requested = remoteStats.peek();
+        if (requested != null) requested = remoteStats.current(SystemClock.elapsedRealtime());
+        inputStatsSession = requested;
+        boolean capture = timingRequiredByPrefs || requested != null || tracing();
+        if (capture != captureTimings) {
+            synchronized (enqueueNsByPtsUs) {
+                if (!capture) enqueueNsByPtsUs.clear();
+                captureTimings = capture;
+            }
+        }
+    }
+
+    private void emitRemoteStats(RemoteStatsSession.Session session, String text, long startUptimeMs, long endUptimeMs) {
+        synchronized (remoteStats) {
+            if (stopping || remoteStats.current(SystemClock.elapsedRealtime()) != session) return;
+            double handoffMs = session.handoffCount == 0 ? -1 : session.handoffSumNs / 1e6 / session.handoffCount;
+            session.handoffSumNs = session.handoffCount = 0;
+            android.util.Log.i("TunedStats", "Session:" + session.id + "|SampleNs:" + System.nanoTime()
+                    + "|WindowStartUptimeMs:" + startUptimeMs + "|WindowEndUptimeMs:" + endUptimeMs + "|"
+                    + text.replace('\n', '|') + String.format(java.util.Locale.US, "|Handoff: %.3f ms", handoffMs));
+        }
+    }
+
     private byte[] nativeInputFallback;
     private Handler nativeOutputHandler;
     private String nativeSelectedName;
@@ -71,9 +142,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return;
         }
         submitDecodeUnitInternal(null, 0, MoonBridge.BUFFER_TYPE_PICDATA, frameNumber, frameType, hostLatency, receiveMs, enqueueMs, -1);
-        long queuedNs = System.nanoTime();
-        synchronized (enqueueNsByPtsUs) { enqueueNsByPtsUs.put(ptsUs, queuedNs); }
-        noteInput(queuedNs); noteHandoff(queuedNs, ptsUs); numFramesIn++;
+        if (captureTimings) {
+            long queuedNs = System.nanoTime();
+            synchronized (enqueueNsByPtsUs) { enqueueNsByPtsUs.put(ptsUs, new FrameTiming(queuedNs, inputStatsSession)); }
+            noteInput(queuedNs); noteHandoff(queuedNs, ptsUs);
+        }
+        numFramesIn++;
     }
     @androidx.annotation.Keep
     public void nativeOutput(int index, long ptsUs, long readyNs, long releaseNs) {
@@ -178,8 +252,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         slotDequeueNs[slot] = nowNs;
         outputLogNs[outputLogCount++ % CADENCE_LOG_SIZE] = nowNs;
         synchronized (enqueueNsByPtsUs) {
-            Long enqueueNs = enqueueNsByPtsUs.get(presentationTimeUs);
-            slotEnqueueNs[slot] = enqueueNs != null ? enqueueNs : 0L;
+            FrameTiming timing = enqueueNsByPtsUs.get(presentationTimeUs);
+            slotEnqueueNs[slot] = timing != null ? timing.queuedNs : 0L;
         }
     }
 
@@ -277,21 +351,28 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     // Update stats using real decode time: enqueue->dequeue, instead of uptime - PTS
     private void updateDecodeLatencyStats(long presentationTimeUs) {
-        Long enqNs;
+        if (!captureTimings) return;
+        FrameTiming timing;
         synchronized (enqueueNsByPtsUs) {
-            enqNs = enqueueNsByPtsUs.get(presentationTimeUs);
+            timing = enqueueNsByPtsUs.get(presentationTimeUs);
             enqueueNsByPtsUs.delete(presentationTimeUs);
         }
-        if (enqNs != null) {
-            long readyNs = outputReadyPtsUs == presentationTimeUs ? outputReadyNs : System.nanoTime();
-            long decMs = (readyNs - enqNs) / 1_000_000L;
-            if (decMs >= 0 && decMs < 1000) {
-                activeWindowVideoStats.decoderTimeMs += decMs;
-                if (!USE_FRAME_RENDER_TIME) {
-                    activeWindowVideoStats.totalTimeMs += decMs;
-                }
+        if (timing == null) return;
+        long readyNs = outputReadyPtsUs == presentationTimeUs ? outputReadyNs : System.nanoTime();
+        long decMs = (readyNs - timing.queuedNs) / 1_000_000L;
+        if (decMs < 0 || decMs >= 1000) return;
+        if (timingRequiredByPrefs) {
+            addDecodeTime(decMs);
+        } else if (timing.session != null) {
+            synchronized (remoteStats) {
+                if (remoteStats.current(SystemClock.elapsedRealtime()) == timing.session) addDecodeTime(decMs);
             }
         }
+    }
+
+    private void addDecodeTime(long decMs) {
+        activeWindowVideoStats.decoderTimeMs += decMs;
+        if (!USE_FRAME_RENDER_TIME) activeWindowVideoStats.totalTimeMs += decMs;
     }
 
     public void setPreferLowerDelays(boolean v) { this.preferLowerDelays = v; }
@@ -388,8 +469,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private int numSpsIn;
     private int numPpsIn;
     private int numVpsIn;
-    private int numFramesIn;
-    private int numFramesOut;
+    private volatile int numFramesIn;
+    private volatile int numFramesOut;
 
     private int targetFps = 0;
 
@@ -568,6 +649,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.context = activity;
         this.activity = activity;
         this.prefs = prefs;
+        timingRequiredByPrefs = prefs.enablePerfOverlay || prefs.enablePerfLogging || prefs.enableLatencyToast;
+        captureTimings = timingRequiredByPrefs;
         this.crashListener = crashListener;
         this.consecutiveCrashCount = consecutiveCrashCount;
         this.glRenderer = glRenderer;
@@ -1945,6 +2028,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     public void prepareForStop() {
         // Let the decoding code know to ignore codec exceptions now
         stopping = true;
+        remoteStats.close();
         if (nativeCodec) MoonBridge.nativeCodecPrepareStop();
 
         // Halt the rendering thread
@@ -2009,6 +2093,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     @Override
     public void cleanup() {
         stopping = true;
+        remoteStats.close();
         stopCodecCallbacks();
         if (nativeCodec) { MoonBridge.nativeCodecClose(); nativeCodec = false; }
         if (videoDecoder != null) videoDecoder.release();
@@ -2046,22 +2131,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     // Tuned build: time from frame reassembled (native, ms clock) to queued in the decoder, averaged per stats window.
     // Both clocks are CLOCK_MONOTONIC; the ms truncation adds a constant ~0.5 ms, so compare it between runs only.
-    private static long handoffSumNs, handoffCount;
-
-    private static synchronized void noteHandoff(long nowNs, long timestampUs) {
+    private void noteHandoff(long nowNs, long timestampUs) {
+        RemoteStatsSession.Session session = inputStatsSession;
+        if (session == null) return;
         long handoffNs = nowNs - timestampUs * 1000L;
         if (handoffNs >= 0 && handoffNs < 1_000_000_000L) {
-            handoffSumNs += handoffNs;
-            handoffCount++;
+            session.handoffSumNs += handoffNs;
+            session.handoffCount++;
         }
-    }
-
-    // Mean handoff in ms since the last call, or -1 when no frame was queued
-    public static synchronized double takeTunedHandoffMs() {
-        double meanMs = handoffCount > 0 ? handoffSumNs / 1e6 / handoffCount : -1;
-        handoffSumNs = 0;
-        handoffCount = 0;
-        return meanMs;
     }
 
     private boolean queueNextInputBuffer(long timestampUs, int codecFlags) {
@@ -2069,12 +2146,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         try {
             // Register before submission: an async output may arrive before this call returns.
-            long nowNs = System.nanoTime();
-            synchronized (enqueueNsByPtsUs) {
-                enqueueNsByPtsUs.put(timestampUs, nowNs);
+            if (captureTimings) {
+                long nowNs = System.nanoTime();
+                synchronized (enqueueNsByPtsUs) {
+                    enqueueNsByPtsUs.put(timestampUs, new FrameTiming(nowNs, inputStatsSession));
+                }
+                noteInput(nowNs);
+                noteHandoff(nowNs, timestampUs);
             }
-            noteInput(nowNs);
-            noteHandoff(nowNs, timestampUs);
             videoDecoder.queueInputBuffer(nextInputBufferIndex,
                     0, nextInputBuffer.position(),
                     timestampUs, codecFlags);
@@ -2165,11 +2244,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return MoonBridge.DR_OK;
         }
 
+        refreshStatsCapture();
         if (lastFrameNumber == 0) {
             activeWindowVideoStats.measurementStartTimestamp = SystemClock.uptimeMillis();
         } else if (frameNumber != lastFrameNumber && frameNumber != lastFrameNumber + 1) {
             // We can receive the same "frame" multiple times if it's an IDR frame.
             // In that case, each frame start NALU is submitted independently.
+            networkFramesLost += frameNumber - lastFrameNumber - 1;
             activeWindowVideoStats.framesLost += frameNumber - lastFrameNumber - 1;
             activeWindowVideoStats.totalFrames += frameNumber - lastFrameNumber - 1;
             activeWindowVideoStats.frameLossEvents++;
@@ -2186,8 +2267,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Flip stats windows roughly every second
         if (SystemClock.uptimeMillis() >= activeWindowVideoStats.measurementStartTimestamp + 1000) {
-            // Tuned build always computes stats, so they reach logcat even with the overlay hidden
-            if (prefs.enablePerfOverlay || prefs.enablePerfLogging || TUNED_BUILD) {
+            RemoteStatsSession.Session session = inputStatsSession;
+            long windowStart = lastWindowVideoStats.measurementStartTimestamp != 0
+                    ? lastWindowVideoStats.measurementStartTimestamp : activeWindowVideoStats.measurementStartTimestamp;
+            boolean remoteReady = session != null
+                    && SystemClock.elapsedRealtime() - session.startedElapsedMs >= RemoteStatsSession.WARMUP_MS
+                    && windowStart >= session.startedUptimeMs;
+            if (prefs.enablePerfOverlay || prefs.enablePerfLogging || remoteReady) {
                 VideoStats lastTwo = new VideoStats();
                 lastTwo.add(lastWindowVideoStats);
                 lastTwo.add(activeWindowVideoStats);
@@ -2292,9 +2378,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     sb.append(context.getString(R.string.perf_overlay_dectime, decodeTimeMs));
                 }
                 String fullLog = sb.toString();
-                if(prefs.enablePerfOverlay || TUNED_BUILD) {
-                    perfListener.onPerfUpdate(fullLog);
-                }
+                if (prefs.enablePerfOverlay) perfListener.onPerfUpdate(fullLog);
+                if (remoteReady) emitRemoteStats(session, fullLog, windowStart, SystemClock.uptimeMillis());
                 // Best latency is only met at requested highest fps, rest can be ignored
                 Boolean targetFpsMatched = ((int) fps.totalFps == (int) prefs.fps);
                 if(minDecodeTime > decodeTimeMs && targetFpsMatched) {
