@@ -112,6 +112,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private void refreshStatsCapture() {
         RemoteStatsSession.Session requested = remoteStats.peek();
         if (requested != null) requested = remoteStats.current(SystemClock.elapsedRealtime());
+        if (requested != inputStatsSession && !prefs.enablePerfOverlay && !prefs.enablePerfLogging) {
+            // A remote-only collection gap is not a one-second bandwidth sample.
+            lastNetDataNum = 0;
+        }
         inputStatsSession = requested;
         boolean capture = timingRequiredByPrefs || requested != null || tracing();
         if (capture != captureTimings) {
