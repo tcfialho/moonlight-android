@@ -272,7 +272,8 @@ public class PreferenceConfiguration {
 
     public float convergence_ratio;
     public float balance_shift;
-    public boolean enablePerfOverlay;
+    // The game menu toggles this while the decoder input/output threads are running.
+    public volatile boolean enablePerfOverlay;
     public boolean enablePerfLogging;
     //简化版性能信息
     public boolean enablePerfOverlayLite;

@@ -67,7 +67,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
     private final RemoteStatsSession remoteStats = new RemoteStatsSession();
     private RemoteStatsSession.Session inputStatsSession;
-    private final boolean timingRequiredByPrefs;
+    private final boolean timingRequiredWithoutOverlay;
     private volatile boolean captureTimings;
     private volatile long networkFramesLost;
     private final String rendererId = android.os.Process.myPid() + "-" + System.nanoTime();
@@ -117,7 +117,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             lastNetDataNum = 0;
         }
         inputStatsSession = requested;
-        boolean capture = timingRequiredByPrefs || requested != null || tracing();
+        boolean capture = timingRequiredWithoutOverlay || prefs.enablePerfOverlay || requested != null || tracing();
         if (capture != captureTimings) {
             synchronized (enqueueNsByPtsUs) {
                 if (!capture) enqueueNsByPtsUs.clear();
@@ -368,7 +368,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         long readyNs = outputReadyPtsUs == presentationTimeUs ? outputReadyNs : System.nanoTime();
         long decMs = (readyNs - timing.queuedNs) / 1_000_000L;
         if (decMs < 0 || decMs >= 1000) return;
-        if (timingRequiredByPrefs) {
+        if (timingRequiredWithoutOverlay || prefs.enablePerfOverlay) {
             addDecodeTime(decMs);
         } else if (timing.session != null) {
             synchronized (remoteStats) {
@@ -656,8 +656,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.context = activity;
         this.activity = activity;
         this.prefs = prefs;
-        timingRequiredByPrefs = prefs.enablePerfOverlay || prefs.enablePerfLogging || prefs.enableLatencyToast;
-        captureTimings = timingRequiredByPrefs;
+        timingRequiredWithoutOverlay = prefs.enablePerfLogging || prefs.enableLatencyToast;
+        captureTimings = timingRequiredWithoutOverlay || prefs.enablePerfOverlay;
         this.crashListener = crashListener;
         this.consecutiveCrashCount = consecutiveCrashCount;
         this.glRenderer = glRenderer;
