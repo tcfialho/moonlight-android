@@ -55,7 +55,7 @@ endif
 
 # Aggressive optimization for the tuned build type
 ifeq ($(TUNED_BUILD),1)
-LOCAL_CFLAGS += -O3 -ffast-math -funroll-loops -fomit-frame-pointer -flto
+LOCAL_CFLAGS += -O3 -ffast-math -funroll-loops -fomit-frame-pointer -flto -DLC_VIDEO_RECEIVE_BATCH
 LOCAL_LDFLAGS += -O3 -flto
 # Fire TV Stick 4K Max runs a 32-bit userland on Cortex-A55 cores, which support ARMv8 AArch32 code
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
